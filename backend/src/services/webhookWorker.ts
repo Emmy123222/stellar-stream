@@ -1,7 +1,6 @@
 import axios from "axios";
-import { createHmac } from "crypto";
 import { getDb } from "./db";
-import { getRetryDelaySeconds } from "./webhook";
+import { getRetryDelaySeconds, computeSignature } from "./webhook";
 
 let isProcessing = false;
 let pollingInterval: NodeJS.Timeout | null = null;
@@ -50,10 +49,7 @@ export const processWebhookQueue = async () => {
 
         const signingSecret = process.env.WEBHOOK_SIGNING_SECRET;
         if (signingSecret) {
-          const signature = createHmac("sha256", signingSecret)
-            .update(bodyString)
-            .digest("hex");
-          headers["X-Webhook-Signature"] = `sha256=${signature}`;
+          headers["X-StellarStream-Signature"] = computeSignature(signingSecret, bodyString);
         }
 
         await axios.post(url, bodyString, { headers });

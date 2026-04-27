@@ -21,6 +21,7 @@ import {
 } from "./services/eventHistory";
 import { fetchOpenIssues } from "./services/openIssues";
 import { initIndexer, startIndexer, getCircuitBreakerStatus } from "./services/indexer";
+import { getStreamStats } from "./services/stats";
 import { startReconciliationJob } from "./services/reconciliationJob";
 import { startWebhookWorker } from "./services/webhookWorker";
 import { getDeadLetters, countDeadLetters } from "./services/webhook";
@@ -156,6 +157,18 @@ app.get("/api/assets", (_req: Request, res: Response) => {
   res.json({
     data: ALLOWED_ASSETS,
   });
+});
+
+app.get("/api/stats", (_req: Request, res: Response) => {
+  try {
+    const stats = getStreamStats();
+    res.json({ data: stats });
+  } catch (error: any) {
+    const normalizedError = normalizeUnknownApiError(error, "Failed to compute stats.");
+    sendApiError(_req, res, normalizedError.statusCode, normalizedError.message, {
+      code: normalizedError.code ?? "INTERNAL_ERROR",
+    });
+  }
 });
 
 app.get("/api/streams", (req: Request, res: Response) => {

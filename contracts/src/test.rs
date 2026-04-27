@@ -3,7 +3,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    token, Address, Env, IntoVal, Vec, symbol_short,
+    token, Address, Env, IntoVal, Map, Vec, symbol_short,
 };
 use insta::assert_debug_snapshot as assert_snapshot;
 
@@ -630,6 +630,31 @@ fn test_vested_amount_fuzz_invariants() {
             assert_eq!(vested, stream.total_amount);
         }
     }
+}
+
+#[test]
+#[should_panic(expected = "invalid token contract")]
+fn test_create_stream_fails_with_invalid_token_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Use a random address that does not host a token contract
+    let invalid_token = Address::generate(&env);
+
+    client.create_stream(
+        &sender,
+        &recipient,
+        &invalid_token,
+        &1000,
+        &0,
+        &1000,
+        &None,
+    );
 }
 
 #[test]

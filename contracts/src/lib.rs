@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token::Client as TokenClient, Address, Env,
-    String, Vec,
+    Map, String, Val, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,6 +122,14 @@ impl StellarStreamContract {
         }
         if end_time <= start_time {
             panic!("end_time must be greater than start_time");
+        }
+
+        // Validate that the token address is a valid SAC (SEP-41)
+        if env
+            .try_invoke_contract::<Vec<Val>, u32>(&token, &symbol_short!("decimals"), Vec::new(&env))
+            .is_err()
+        {
+            panic!("invalid token contract");
         }
 
         let token_client = TokenClient::new(&env, &token);

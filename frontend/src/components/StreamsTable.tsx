@@ -1,4 +1,4 @@
-import { useMemo, useState, useRef, type RefObject } from "react";
+
 import { Stream } from "../types/stream";
 import { getExportCsvUrl, ListStreamsFilters, cancelStream } from "../services/api";
 import { CopyableAddress } from "./CopyableAddress";
@@ -33,38 +33,7 @@ function formatTimestamp(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleString();
 }
 
-/**
- * StreamsTable Component
- * 
- * Displays a table of payment streams with bulk selection and cancellation capabilities.
- * 
- * Selection Logic:
- * - Only streams with status "active" or "scheduled" can be selected
- * - Individual checkboxes appear in the first column for eligible streams
- * - "Select All" checkbox in header toggles all eligible streams on current page
- * - Selection state is maintained in a Set for O(1) lookup performance
- * - Selections are automatically cleaned up when streams change (e.g., after filtering)
- * 
- * Bulk Cancellation:
- * - Floating action bar appears when 1+ streams are selected
- * - Cancel operations execute sequentially (not in parallel) to avoid overwhelming the backend
- * - Progress indicator shows current/total during bulk operations
- * - Failed cancellations are logged but don't stop the sequence
- * - Table refreshes automatically after bulk operation completes
- */
-export function StreamsTable({
-  streams,
-  filters,
-  onFiltersChange,
-  onCancel,
-  onEditStartTime,
-  onOpenStream,
-}: StreamsTableProps) {
-  const [expandedStreamId, setExpandedStreamId] = useState<string | null>(null);
-  const exportUrl = useMemo(() => getExportCsvUrl(filters as Record<string, string>), [filters]);
 
-  const toggleTimeline = (streamId: string) => {
-    setExpandedStreamId((prev) => (prev === streamId ? null : streamId));
   };
 
   // Helper: determine if a stream is eligible for selection (active or scheduled)
@@ -299,7 +268,6 @@ function BulkActionBar({
   );
 }
 
-
 // ── StreamRow ─────────────────────────────────────────────────────────────
 // Extracted so each row can hold its own triggerRef without polluting the
 // parent component's hook rules.
@@ -439,4 +407,3 @@ function StreamRow({
     </>
   );
 }
-

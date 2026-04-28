@@ -41,7 +41,9 @@ function migrate(): void {
       canceled_at     INTEGER,
       completed_at    INTEGER,
       refunded_amount REAL,
-      archived_at     INTEGER
+      archived_at     INTEGER,
+      paused_at       INTEGER,
+      paused_duration INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS stream_archive (
@@ -56,7 +58,9 @@ function migrate(): void {
       canceled_at     INTEGER,
       completed_at    INTEGER,
       refunded_amount REAL,
-      archived_at     INTEGER NOT NULL
+      archived_at     INTEGER NOT NULL,
+      paused_at       INTEGER,
+      paused_duration INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS stream_events (
@@ -102,8 +106,8 @@ function migrate(): void {
     CREATE INDEX IF NOT EXISTS idx_webhook_dead_letters_failed_at ON webhook_dead_letters(failed_at);
 
     CREATE TABLE IF NOT EXISTS indexer_cursor (
-      id TEXT PRIMARY KEY,
-      last_ledger INTEGER NOT NULL
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_ledger_sequence INTEGER NOT NULL
     );
   `);
 }

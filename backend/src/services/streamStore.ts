@@ -10,6 +10,7 @@ import {
   Networks,
   Account,
 } from "@stellar/stellar-sdk";
+import pLimit from "p-limit";
 import { initDb, getDb } from "./db";
 import { recordEventWithDb } from "./eventHistory";
 import { streamHasEvent } from "./eventHistory";
@@ -38,6 +39,8 @@ export interface StreamRecord {
   canceledAt?: number;
   completedAt?: number;
   refundedAmount?: number;
+  pausedAt?: number;
+  pausedDuration: number;
 }
 
 export interface StreamProgress {
@@ -62,6 +65,8 @@ interface StreamRow {
   completed_at: number | null;
   refunded_amount: number | null;
   archived_at: number | null;
+  paused_at: number | null;
+  paused_duration: number;
 }
 
 function rowToRecord(row: StreamRow): StreamRecord {
@@ -77,6 +82,8 @@ function rowToRecord(row: StreamRow): StreamRecord {
     canceledAt: row.canceled_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
     refundedAmount: row.refunded_amount ?? undefined,
+    pausedAt: row.paused_at ?? undefined,
+    pausedDuration: row.paused_duration,
   };
 }
 
@@ -84,8 +91,8 @@ function upsertStream(record: StreamRecord): void {
   const db = getDb();
   db.prepare(
     `
-    INSERT INTO streams (id, sender, recipient, asset_code, total_amount, duration_seconds, start_at, created_at, canceled_at, completed_at, refunded_amount, archived_at)
-    VALUES (@id, @sender, @recipient, @assetCode, @totalAmount, @durationSeconds, @startAt, @createdAt, @canceledAt, @completedAt, @refundedAmount, @archivedAt)
+    INSERT INTO streams (id, sender, recipient, asset_code, total_amount, duration_seconds, start_at, created_at, canceled_at, completed_at, refunded_amount, archived_at, paused_at, paused_duration)
+    VALUES (@id, @sender, @recipient, @assetCode, @totalAmount, @durationSeconds, @startAt, @createdAt, @canceledAt, @completedAt, @refundedAmount, @archivedAt, @pausedAt, @pausedDuration)
     ON CONFLICT(id) DO UPDATE SET
       sender = excluded.sender,
       recipient = excluded.recipient,
@@ -97,7 +104,9 @@ function upsertStream(record: StreamRecord): void {
       canceled_at = excluded.canceled_at,
       completed_at = excluded.completed_at,
       refunded_amount = excluded.refunded_amount,
-      archived_at = excluded.archived_at
+      archived_at = excluded.archived_at,
+      paused_at = excluded.paused_at,
+      paused_duration = excluded.paused_duration
   `,
   ).run({
     id: record.id,
@@ -112,6 +121,8 @@ function upsertStream(record: StreamRecord): void {
     completedAt: record.completedAt ?? null,
     refundedAmount: record.refundedAmount ?? null,
     archivedAt: null,
+    pausedAt: record.pausedAt ?? null,
+    pausedDuration: record.pausedDuration ?? 0,
   });
 }
 
@@ -353,6 +364,9 @@ function computeStatus(stream: StreamRecord, at: number): StreamStatus {
   if (at >= stream.startAt + stream.durationSeconds) {
     return "completed";
   }
+  if (stream.pausedAt !== undefined) {
+    return "active"; // Or could be a "paused" status if we want to add it
+  }
   return "active";
 }
 
@@ -361,11 +375,19 @@ export function calculateProgress(
   at = nowInSeconds(),
 ): StreamProgress {
   const streamEnd = stream.startAt + stream.durationSeconds;
+  
+  // Calculate paused duration including current pause if active
+  let pausedDuration = stream.pausedDuration;
+  if (stream.pausedAt !== undefined) {
+    pausedDuration += Math.max(0, at - stream.pausedAt);
+  }
+
   const effectiveEnd =
     stream.canceledAt !== undefined
-      ? Math.min(stream.canceledAt, streamEnd)
-      : streamEnd;
-  const elapsed = Math.max(0, Math.min(at, effectiveEnd) - stream.startAt);
+      ? Math.min(stream.canceledAt, streamEnd + pausedDuration)
+      : streamEnd + pausedDuration;
+  
+  const elapsed = Math.max(0, Math.min(at, effectiveEnd) - stream.startAt - pausedDuration);
   const ratio = Math.min(1, elapsed / stream.durationSeconds);
   const vestedAmount = stream.totalAmount * ratio;
 
@@ -383,26 +405,66 @@ export async function syncStreams() {
   const sorobanContext = getSorobanContext();
   if (!sorobanContext) return;
 
+  const syncStart = Date.now();
+
   try {
     const sourceAccount = await sorobanContext.sourceAccountPromise;
     const nextId = await fetchNextOnChainStreamId(
       sorobanContext.contract,
       sourceAccount,
     );
-    if (nextId === null) {
-      return;
+    if (nextId === null) return;
+
+    const ids = Array.from({ length: nextId - 1 }, (_, i) => i + 1);
+
+    // Concurrency-limited parallel fetch — max 5 simultaneous RPC calls.
+    // Falls back to sequential per-stream if the parallel pass throws.
+    const limit = pLimit(5);
+    let parallelFailed = false;
+
+    try {
+      await Promise.all(
+        ids.map((id) =>
+          limit(async () => {
+            const stream = await fetchOnChainStreamRecord(
+              sorobanContext.contract,
+              sourceAccount,
+              id,
+            );
+            if (stream) upsertStream(stream);
+          }),
+        ),
+      );
+    } catch (err) {
+      console.warn(
+        "[syncStreams] parallel fetch failed, falling back to sequential",
+        err,
+      );
+      parallelFailed = true;
     }
 
-    for (let i = 1; i < nextId; i++) {
-      const stream = await fetchOnChainStreamRecord(
-        sorobanContext.contract,
-        sourceAccount,
-        i,
-      );
-      if (stream) {
-        upsertStream(stream);
+    if (parallelFailed) {
+      for (const id of ids) {
+        try {
+          const stream = await fetchOnChainStreamRecord(
+            sorobanContext.contract,
+            sourceAccount,
+            id,
+          );
+          if (stream) upsertStream(stream);
+        } catch (e) {
+          console.error(
+            `[syncStreams] failed to fetch stream ${id} sequentially`,
+            e,
+          );
+        }
       }
     }
+
+    const elapsed = Date.now() - syncStart;
+    console.log(
+      `[syncStreams] completed in ${elapsed}ms (${ids.length} stream(s))`,
+    );
   } catch (err) {
     console.error("Failed to sync streams", err);
   }
@@ -580,6 +642,104 @@ export async function createStream(input: StreamInput): Promise<StreamRecord> {
   // must never roll back an already-persisted stream.
   triggerWebhook("created", stream);
   return stream;
+}
+
+export async function pauseStream(id: string): Promise<StreamRecord | undefined> {
+  const stream = getStream(id);
+  if (!stream || stream.pausedAt !== undefined || stream.canceledAt !== undefined || stream.completedAt !== undefined) {
+    return stream;
+  }
+
+  const sorobanContext = getSorobanContext();
+  if (sorobanContext && rpcServer && serverKeypair) {
+    const sourceAccount = await rpcServer.getAccount(serverKeypair.publicKey());
+    const tx = sorobanContext.contract.call(
+      "pause_stream",
+      nativeToScVal(parseInt(id), { type: "u64" }),
+    );
+
+    const built = await rpcServer.prepareTransaction(
+      new TransactionBuilder(sourceAccount, {
+        fee: "1000",
+        networkPassphrase: process.env.NETWORK_PASSPHRASE || Networks.TESTNET,
+      })
+        .addOperation(tx)
+        .setTimeout(30)
+        .build(),
+    );
+
+    built.sign(serverKeypair);
+    const sendRes = await retryWithBackoff(() => rpcServer!.sendTransaction(built));
+    if (sendRes.status === "PENDING") {
+      let txResult;
+      let attempts = 0;
+      while (attempts < 10) {
+        txResult = await retryWithBackoff(() => rpcServer!.getTransaction(sendRes.hash));
+        if (txResult.status !== "NOT_FOUND") break;
+        await new Promise((r) => setTimeout(r, 1000));
+        attempts++;
+      }
+    }
+  }
+
+  const now = nowInSeconds();
+  const db = getDb();
+  db.prepare("UPDATE streams SET paused_at = ? WHERE id = ?").run(now, id);
+  
+  invalidateCache(`stream:${id}`);
+  return getStream(id);
+}
+
+export async function resumeStream(id: string): Promise<StreamRecord | undefined> {
+  const stream = getStream(id);
+  if (!stream || stream.pausedAt === undefined) {
+    return stream;
+  }
+
+  const sorobanContext = getSorobanContext();
+  if (sorobanContext && rpcServer && serverKeypair) {
+    const sourceAccount = await rpcServer.getAccount(serverKeypair.publicKey());
+    const tx = sorobanContext.contract.call(
+      "resume_stream",
+      nativeToScVal(parseInt(id), { type: "u64" }),
+    );
+
+    const built = await rpcServer.prepareTransaction(
+      new TransactionBuilder(sourceAccount, {
+        fee: "1000",
+        networkPassphrase: process.env.NETWORK_PASSPHRASE || Networks.TESTNET,
+      })
+        .addOperation(tx)
+        .setTimeout(30)
+        .build(),
+    );
+
+    built.sign(serverKeypair);
+    const sendRes = await retryWithBackoff(() => rpcServer!.sendTransaction(built));
+    if (sendRes.status === "PENDING") {
+      let txResult;
+      let attempts = 0;
+      while (attempts < 10) {
+        txResult = await retryWithBackoff(() => rpcServer!.getTransaction(sendRes.hash));
+        if (txResult.status !== "NOT_FOUND") break;
+        await new Promise((r) => setTimeout(r, 1000));
+        attempts++;
+      }
+    }
+  }
+
+  const now = nowInSeconds();
+  const additionalPausedDuration = Math.max(0, now - stream.pausedAt);
+  const newTotalPausedDuration = stream.pausedDuration + additionalPausedDuration;
+
+  const db = getDb();
+  db.prepare("UPDATE streams SET paused_at = NULL, paused_duration = ? WHERE id = ?").run(
+    newTotalPausedDuration,
+    id,
+  );
+
+  invalidateCache(`stream:${id}`);
+  return getStream(id);
 }
 
 export function refreshStreamStatuses(): number {

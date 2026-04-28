@@ -288,3 +288,367 @@ describe("reconcileMissingStreams", () => {
     errorSpy.mockRestore();
   });
 });
+
+describe("archiveOldStreams", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    mockState.nextId = 1;
+    mockState.existingStreamIds = new Set<string>();
+    mockState.chainStreams = new Map<number, any>();
+    mockState.upsertedStreams = [];
+    mockState.createdEventIds = new Set<string>();
+
+    dbMocks.getDb.mockReturnValue(createDbMock());
+    dbMocks.initDb.mockImplementation(() => undefined);
+
+    process.env.CONTRACT_ID = "test-contract";
+    process.env.RPC_URL = "https://rpc.test";
+    delete process.env.SERVER_PRIVATE_KEY;
+  });
+
+  function createArchiveDbMock() {
+    const streams: any[] = [];
+    const archivedStreams: any[] = [];
+
+    return {
+      prepare(sql: string) {
+        if (sql.includes("SELECT * FROM streams") && 
+            sql.includes("WHERE completed_at IS NOT NULL") && 
+            sql.includes("AND completed_at < ?") && 
+            sql.includes("AND archived_at IS NULL")) {
+          return {
+            all: (params: any) => {
+              const threshold = params; // params is the threshold directly, not an array
+              return streams.filter(stream => 
+                stream.completed_at && 
+                stream.completed_at < threshold && 
+                !stream.archived_at
+              );
+            },
+          };
+        }
+
+        if (sql.includes("INSERT INTO stream_archive")) {
+          return {
+            run: (...params: any[]) => {
+              archivedStreams.push({
+                id: params[0],
+                sender: params[1],
+                recipient: params[2],
+                asset_code: params[3],
+                total_amount: params[4],
+                duration_seconds: params[5],
+                start_at: params[6],
+                created_at: params[7],
+                canceled_at: params[8],
+                completed_at: params[9],
+                refunded_amount: params[10],
+                archived_at: params[11],
+              });
+              return { changes: 1 };
+            },
+          };
+        }
+
+        if (sql.includes("UPDATE streams SET archived_at")) {
+          return {
+            run: (...params: any[]) => {
+              const archivedAt = params[0];
+              const streamId = params[1];
+              const stream = streams.find(s => s.id === streamId);
+              if (stream) {
+                stream.archived_at = archivedAt;
+              }
+              return { changes: 1 };
+            },
+          };
+        }
+
+        if (sql.includes("SELECT * FROM streams WHERE archived_at IS NULL")) {
+          return {
+            all: () => streams.filter(stream => !stream.archived_at).sort((a, b) => b.created_at - a.created_at),
+          };
+        }
+
+        if (sql.includes("SELECT * FROM streams ORDER BY created_at DESC")) {
+          return {
+            all: () => streams.sort((a, b) => b.created_at - a.created_at),
+          };
+        }
+
+        if (sql.includes("SELECT * FROM streams WHERE id = ?")) {
+          return {
+            get: (params: any) => streams.find(s => s.id === params[0]),
+          };
+        }
+
+        return {
+          all: () => [],
+          run: () => ({ changes: 0 }),
+          get: () => undefined,
+        };
+      },
+      transaction<T extends (...args: any[]) => any>(callback: T): T {
+        return ((...args: Parameters<T>) => {
+          // Execute the callback within transaction context
+          return callback(...args);
+        }) as T;
+      },
+      // Helper methods for test setup
+      _addStream(stream: any) {
+        streams.push(stream);
+      },
+      _getArchivedStreams() {
+        return archivedStreams;
+      },
+      _getStreams() {
+        return streams;
+      },
+    };
+  }
+
+  it("archives completed streams older than 30 days", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const thirtyOneDaysAgo = now - 31 * 24 * 60 * 60;
+    
+    // Mock Date.now to return a consistent time
+    const mockDateNow = now * 1000;
+    vi.spyOn(Date, 'now').mockReturnValue(mockDateNow);
+    
+    const dbMock = createArchiveDbMock();
+    dbMock._addStream({
+      id: "1",
+      sender: "GSENDER1",
+      recipient: "GRECIPIENT1",
+      asset_code: "USDC",
+      total_amount: 100,
+      duration_seconds: 3600,
+      start_at: thirtyOneDaysAgo - 3600,
+      created_at: thirtyOneDaysAgo - 3600,
+      completed_at: thirtyOneDaysAgo,
+      archived_at: null,
+    });
+
+    dbMocks.getDb.mockReturnValue(dbMock);
+
+    const { archiveOldStreams } = await import("./streamStore");
+    const archivedCount = await archiveOldStreams();
+
+    expect(archivedCount).toBe(1);
+    const archivedStreams = dbMock._getArchivedStreams();
+    expect(archivedStreams).toHaveLength(1);
+    expect(archivedStreams[0]).toMatchObject({
+      id: "1",
+      sender: "GSENDER1",
+      recipient: "GRECIPIENT1",
+      asset_code: "USDC",
+      total_amount: 100,
+    });
+    expect(archivedStreams[0].archived_at).toBeGreaterThan(0);
+    
+    const streams = dbMock._getStreams();
+    expect(typeof streams[0].archived_at).toBe('number');
+    expect(streams[0].archived_at).toBeGreaterThan(0);
+    
+    vi.restoreAllMocks();
+  });
+
+  it("does not archive completed streams younger than 30 days", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const twentyNineDaysAgo = now - 29 * 24 * 60 * 60;
+    
+    const dbMock = createArchiveDbMock();
+    dbMock._addStream({
+      id: "1",
+      sender: "GSENDER1",
+      recipient: "GRECIPIENT1",
+      asset_code: "USDC",
+      total_amount: 100,
+      duration_seconds: 3600,
+      start_at: twentyNineDaysAgo - 3600,
+      created_at: twentyNineDaysAgo - 3600,
+      completed_at: twentyNineDaysAgo,
+      archived_at: null,
+    });
+
+    dbMocks.getDb.mockReturnValue(dbMock);
+
+    const { archiveOldStreams } = await import("./streamStore");
+    const archivedCount = await archiveOldStreams();
+
+    expect(archivedCount).toBe(0);
+    const archivedStreams = dbMock._getArchivedStreams();
+    expect(archivedStreams).toHaveLength(0);
+    
+    const streams = dbMock._getStreams();
+    expect(streams[0].archived_at).toBeNull();
+  });
+
+  it("does not archive active streams older than 30 days", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const thirtyOneDaysAgo = now - 31 * 24 * 60 * 60;
+    
+    const dbMock = createArchiveDbMock();
+    dbMock._addStream({
+      id: "1",
+      sender: "GSENDER1",
+      recipient: "GRECIPIENT1",
+      asset_code: "USDC",
+      total_amount: 100,
+      duration_seconds: 3600,
+      start_at: thirtyOneDaysAgo,
+      created_at: thirtyOneDaysAgo,
+      completed_at: null, // Active stream (not completed)
+      archived_at: null,
+    });
+
+    dbMocks.getDb.mockReturnValue(dbMock);
+
+    const { archiveOldStreams } = await import("./streamStore");
+    const archivedCount = await archiveOldStreams();
+
+    expect(archivedCount).toBe(0);
+    const archivedStreams = dbMock._getArchivedStreams();
+    expect(archivedStreams).toHaveLength(0);
+    
+    const streams = dbMock._getStreams();
+    expect(streams[0].archived_at).toBeNull();
+  });
+
+  it("excludes archived streams from default listStreams results", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    
+    const dbMock = createArchiveDbMock();
+    dbMock._addStream({
+      id: "1",
+      sender: "GSENDER1",
+      recipient: "GRECIPIENT1",
+      asset_code: "USDC",
+      total_amount: 100,
+      duration_seconds: 3600,
+      start_at: now - 7200,
+      created_at: now - 7200,
+      completed_at: now - 3600,
+      archived_at: null, // Not archived
+    });
+    dbMock._addStream({
+      id: "2",
+      sender: "GSENDER2",
+      recipient: "GRECIPIENT2",
+      asset_code: "USDC",
+      total_amount: 200,
+      duration_seconds: 3600,
+      start_at: now - 7200,
+      created_at: now - 7200,
+      completed_at: now - 3600,
+      archived_at: now - 1800, // Already archived
+    });
+
+    dbMocks.getDb.mockReturnValue(dbMock);
+
+    const { listStreams } = await import("./streamStore");
+    const defaultStreams = listStreams(); // Default: includeArchived = false
+    const allStreams = listStreams(true); // Explicit: includeArchived = true
+
+    expect(defaultStreams).toHaveLength(1);
+    expect(defaultStreams[0].id).toBe("1");
+    
+    expect(allStreams).toHaveLength(2);
+    expect(allStreams.map(s => s.id)).toEqual(["1", "2"]);
+  });
+
+  it("tests age threshold boundary at exactly 30 days", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const exactlyThirtyDaysAgo = now - 30 * 24 * 60 * 60;
+    
+    const dbMock = createArchiveDbMock();
+    // Stream completed exactly 30 days ago - should not be archived (needs to be older than 30 days)
+    dbMock._addStream({
+      id: "1",
+      sender: "GSENDER1",
+      recipient: "GRECIPIENT1",
+      asset_code: "USDC",
+      total_amount: 100,
+      duration_seconds: 3600,
+      start_at: exactlyThirtyDaysAgo - 3600,
+      created_at: exactlyThirtyDaysAgo - 3600,
+      completed_at: exactlyThirtyDaysAgo,
+      archived_at: null,
+    });
+    // Stream completed 30 days + 1 second ago - should be archived
+    dbMock._addStream({
+      id: "2",
+      sender: "GSENDER2",
+      recipient: "GRECIPIENT2",
+      asset_code: "USDC",
+      total_amount: 200,
+      duration_seconds: 3600,
+      start_at: exactlyThirtyDaysAgo - 3601,
+      created_at: exactlyThirtyDaysAgo - 3601,
+      completed_at: exactlyThirtyDaysAgo - 1,
+      archived_at: null,
+    });
+
+    dbMocks.getDb.mockReturnValue(dbMock);
+
+    const { archiveOldStreams } = await import("./streamStore");
+    const archivedCount = await archiveOldStreams();
+
+    expect(archivedCount).toBe(1);
+    const archivedStreams = dbMock._getArchivedStreams();
+    expect(archivedStreams).toHaveLength(1);
+    expect(archivedStreams[0].id).toBe("2"); // Only the older one gets archived
+    
+    const streams = dbMock._getStreams();
+    expect(streams.find(s => s.id === "1")?.archived_at).toBeNull();
+    expect(streams.find(s => s.id === "2")?.archived_at).toBeGreaterThan(0);
+  });
+
+  it("handles multiple streams in a single transaction", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const thirtyOneDaysAgo = now - 31 * 24 * 60 * 60;
+    
+    const dbMock = createArchiveDbMock();
+    dbMock._addStream({
+      id: "1",
+      sender: "GSENDER1",
+      recipient: "GRECIPIENT1",
+      asset_code: "USDC",
+      total_amount: 100,
+      duration_seconds: 3600,
+      start_at: thirtyOneDaysAgo - 3600,
+      created_at: thirtyOneDaysAgo - 3600,
+      completed_at: thirtyOneDaysAgo,
+      archived_at: null,
+    });
+    dbMock._addStream({
+      id: "2",
+      sender: "GSENDER2",
+      recipient: "GRECIPIENT2",
+      asset_code: "USDC",
+      total_amount: 200,
+      duration_seconds: 3600,
+      start_at: thirtyOneDaysAgo - 3600,
+      created_at: thirtyOneDaysAgo - 3600,
+      completed_at: thirtyOneDaysAgo,
+      archived_at: null,
+    });
+
+    dbMocks.getDb.mockReturnValue(dbMock);
+
+    const { archiveOldStreams } = await import("./streamStore");
+    const archivedCount = await archiveOldStreams();
+
+    expect(archivedCount).toBe(2);
+    const archivedStreams = dbMock._getArchivedStreams();
+    expect(archivedStreams).toHaveLength(2);
+    expect(archivedStreams.map(s => s.id)).toEqual(["1", "2"]);
+    
+    const streams = dbMock._getStreams();
+    streams.forEach(stream => {
+      expect(stream.archived_at).toBeGreaterThan(0);
+    });
+  });
+});

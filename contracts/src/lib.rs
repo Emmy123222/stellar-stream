@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token::Client as TokenClient, Address, Env,
-    Map, String, Vec,
+
 };
 
 const NATIVE_SENTINEL: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
@@ -140,13 +140,6 @@ impl StellarStreamContract {
             panic!("end_time must be greater than start_time");
         }
 
-        let is_native = token.to_string() == String::from_str(&env, NATIVE_SENTINEL);
-        let actual_token = if is_native {
-            env.storage().instance().get(&DataKey::NativeToken).unwrap_or_else(|| panic!("not initialized"))
-        } else {
-            token.clone()
-        };
-        let token_client = TokenClient::new(&env, &actual_token);
 
         let sender_balance = token_client.balance(&sender);
         if sender_balance < total_amount {
@@ -286,7 +279,7 @@ impl StellarStreamContract {
                     total_amount: allocation,
                     start_time,
                     end_time,
-                    cliff_seconds: 0,
+
                     metadata: None,
                 },
             );
@@ -328,6 +321,30 @@ impl StellarStreamContract {
         let vested = vested_amount(&stream, at_time);
         let claimable = vested - stream.claimed_amount;
         if claimable < 0 { 0 } else { claimable }
+    }
+
+    pub fn get_claimable_batch(env: Env, stream_ids: Vec<u64>, at_time: u64) -> Map<u64, i128> {
+        if stream_ids.len() > 20 {
+            panic!("too many stream ids");
+        }
+        let mut result = Map::new(&env);
+        for stream_id in stream_ids.iter() {
+            let stream_opt: Option<Stream> = env.storage().persistent().get(&DataKey::Stream(stream_id));
+            let amount = match stream_opt {
+                Some(stream) => {
+                    let vested = vested_amount(&stream, at_time);
+                    let claimable = vested - stream.claimed_amount;
+                    if claimable < 0 {
+                        0
+                    } else {
+                        claimable
+                    }
+                }
+                None => 0,
+            };
+            result.set(stream_id, amount);
+        }
+        result
     }
 
     // -----------------------------------------------------------------------

@@ -1,5 +1,6 @@
 import axios from "axios";
 import { getDb } from "./db";
+import { getRetryDelaySeconds } from "./webhook";
 
 
 let isProcessing = false;
@@ -66,9 +67,9 @@ export const processWebhookQueue = async () => {
         if (newAttempt >= max_attempts) {
           // Move to dead-letter storage
           db.prepare(
-            `INSERT INTO webhook_dead_letters (url, payload, last_error, failed_at)
-             VALUES (?, ?, ?, ?)`
-          ).run(url, payload, errorMsg, updateNow);
+            `INSERT INTO webhook_dead_letters (stream_id, event, url, payload, last_error, failed_at)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          ).run(delivery.stream_id, event, url, payload, errorMsg, updateNow);
 
           db.prepare(
             `DELETE FROM webhook_deliveries WHERE id = ?`

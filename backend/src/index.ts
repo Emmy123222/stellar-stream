@@ -18,6 +18,7 @@ import {
   getGlobalEvents,
   getStreamHistory,
   countStreamEvents,
+  getStreamEventSummary,
 } from "./services/eventHistory";
 import { fetchOpenIssues } from "./services/openIssues";
 import { initIndexer, startIndexer, getCircuitBreakerStatus } from "./services/indexer";

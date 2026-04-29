@@ -153,6 +153,43 @@ export function countStreamEvents(streamId: string): number {
   return row.count;
 }
 
+export interface StreamEventSummary {
+  totalEvents: number;
+  byType: Partial<Record<StreamEventType, number>>;
+  firstEventAt?: number;
+  lastEventAt?: number;
+}
+
+export function getStreamEventSummary(streamId: string): StreamEventSummary {
+  const db = getDb();
+
+  const countRows = db
+    .prepare(
+      `SELECT event_type, COUNT(*) as count FROM stream_events WHERE stream_id = ? GROUP BY event_type`,
+    )
+    .all(streamId) as Array<{ event_type: string; count: number }>;
+
+  const byType: Partial<Record<StreamEventType, number>> = {};
+  let totalEvents = 0;
+  for (const row of countRows) {
+    byType[row.event_type as StreamEventType] = row.count;
+    totalEvents += row.count;
+  }
+
+  const bounds = db
+    .prepare(
+      `SELECT MIN(timestamp) as first, MAX(timestamp) as last FROM stream_events WHERE stream_id = ?`,
+    )
+    .get(streamId) as { first: number | null; last: number | null };
+
+  return {
+    totalEvents,
+    byType,
+    firstEventAt: bounds.first ?? undefined,
+    lastEventAt: bounds.last ?? undefined,
+  };
+}
+
 export function streamHasEvent(
   streamId: string,
   eventType: StreamEventType,

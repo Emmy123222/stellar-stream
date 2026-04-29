@@ -316,6 +316,35 @@ fn test_cancel_recipient_cannot_claim_beyond_vested_at_cancel_time() {
 }
 
 #[test]
+fn test_cancel_after_partial_claim_refunds_correct_amount_and_preserves_token_conservation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    client.claim(&stream_id, &recipient, &300);
+    env.ledger().with_mut(|l| l.timestamp = 700);
+    client.cancel(&stream_id, &sender);
+
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&sender), 300);
+    assert_eq!(token_client.balance(&recipient), 300);
+    assert_eq!(client.claimable(&stream_id, &9999), 400);
+
+    let stream = client.get_stream(&stream_id);
+    assert_snapshot!("stream_cancel_after_partial_claim", stream);
+    assert_eq!(300 + 300 + 400, 1000);
+}
+
+#[test]
 #[should_panic(expected = "sender mismatch")]
 fn test_cancel_fails_with_wrong_sender() {
     let env = Env::default();
@@ -1175,7 +1204,10 @@ fn test_clawback_emits_event() {
     let client = StellarStreamContractClient::new(&env, &contract_id);
 
     let token_admin = Address::generate(&env);
-    let compliance_admin = Address::generate(&env);
+    let compliance_admin = Address::from_string(&String::from_str(
+        &env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    ));
     let sender = Address::generate(&env);
     let recipient = Address::generate(&env);
     let token = create_token(&env, &token_admin);
@@ -1201,6 +1233,39 @@ fn test_clawback_emits_event() {
     assert_eq!(event_data.stream_id, stream_id);
     assert_eq!(event_data.amount, 250);
     assert_eq!(event_data.recipient, compliance_admin);
+    assert_snapshot!("clawback_executed_event", event_data);
+}
+
+#[test]
+fn test_clawback_after_canceled_stream_transfers_to_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let compliance_admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+    let token_mint = token::StellarAssetClient::new(&env, &token);
+    token_mint.mint(&sender, &1000);
+
+    client.initialize(&compliance_admin, &Address::generate(&env));
+    let stream_id = client.create_stream(
+        &sender, &recipient, &token, &1000, &0, &1000, &None,
+    );
+
+    env.ledger().with_mut(|l| l.timestamp = 400);
+    client.cancel(&stream_id, &sender);
+
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    let clawed = client.clawback(&stream_id, &200, &compliance_admin);
+
+    assert_eq!(clawed, 200);
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&compliance_admin), 200);
+    assert_eq!(client.claimable(&stream_id, &500), 200);
 }
 
 /// Token conservation: recipient claims + admin clawback = total vested at clawback time.
@@ -2044,3 +2109,87 @@ fn test_get_claimable_batch_limit_exceeded() {
     client.get_claimable_batch(&ids, &1000);
 }
 
+
+// =============================================================================
+// #212 — get_split_children returns empty Vec for non-split streams
+// =============================================================================
+
+/// Calling get_split_children on a regular (non-split) stream returns an empty Vec.
+#[test]
+fn test_get_split_children_on_regular_stream_returns_empty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    let children = client.get_split_children(&stream_id);
+    assert_eq!(children.len(), 0);
+}
+
+/// Calling get_split_children on a stream ID that does not exist returns an empty Vec (no panic).
+#[test]
+fn test_get_split_children_on_nonexistent_stream_returns_empty() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let children = client.get_split_children(&9999);
+    assert_eq!(children.len(), 0);
+}
+
+/// Calling get_split_children on a valid parent stream returns the correct child IDs,
+/// and the ChildToParent storage key maps each child back to the parent.
+#[test]
+fn test_get_split_children_on_parent_stream_returns_child_ids_and_child_to_parent_mapping() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient_a = Address::generate(&env);
+    let recipient_b = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back((recipient_a.clone(), 300_i128));
+    recipients.push_back((recipient_b.clone(), 700_i128));
+
+    let parent_id = client.create_split_stream(&sender, &token, &1000, &0, &1000, &recipients);
+    let children = client.get_split_children(&parent_id);
+
+    assert_eq!(children.len(), 2);
+    let child_a_id = children.get(0).unwrap();
+    let child_b_id = children.get(1).unwrap();
+
+    // Verify child streams have correct allocations
+    let child_a = client.get_stream(&child_a_id);
+    let child_b = client.get_stream(&child_b_id);
+    assert_eq!(child_a.total_amount, 300);
+    assert_eq!(child_b.total_amount, 700);
+
+    // Verify ChildToParent storage maps each child back to the parent
+    let parent_of_a: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::ChildToParent(child_a_id))
+        .unwrap();
+    let parent_of_b: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::ChildToParent(child_b_id))
+        .unwrap();
+    assert_eq!(parent_of_a, parent_id);
+    assert_eq!(parent_of_b, parent_id);
+}

@@ -38,8 +38,8 @@ vi.mock("../services/soroban", () => {
   };
 });
 
-import { claimOnChain } from "../services/soroban";
-const mockClaimOnChain = claimOnChain as ReturnType<typeof vi.fn>;
+import { claimStream } from "../services/soroban";
+const mockClaimStream = claimStream as ReturnType<typeof vi.fn>;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -152,7 +152,7 @@ describe("RecipientDashboard", () => {
 
   it("claim button is disabled while a claim is pending", async () => {
     // Never resolves — simulates in-flight transaction
-    mockClaimOnChain.mockReturnValue(new Promise(() => {}));
+    mockClaimStream.mockReturnValue(new Promise(() => {}));
     setupRecipientHandler([activeStream]);
     render(<RecipientDashboard recipientAddress={RECIPIENT} />);
 
@@ -203,10 +203,7 @@ describe("RecipientDashboard", () => {
   });
 
   it("shows error toast when claim fails", async () => {
-    const { SorobanClaimError } = await import("../services/soroban");
-    mockClaimOnChain.mockRejectedValue(
-      new SorobanClaimError("amount exceeds claimable", "INSUFFICIENT_VESTED"),
-    );
+    mockClaimStream.mockRejectedValue(new Error("amount exceeds claimable"));
     setupRecipientHandler([activeStream]);
     render(<RecipientDashboard recipientAddress={RECIPIENT} />);
 
@@ -224,7 +221,7 @@ describe("RecipientDashboard", () => {
   });
 
   it("does not update local state on failed claim", async () => {
-    mockClaimOnChain.mockRejectedValue(new Error("network error"));
+    mockClaimStream.mockRejectedValue(new Error("network error"));
     setupRecipientHandler([activeStream]);
     render(<RecipientDashboard recipientAddress={RECIPIENT} />);
 
@@ -236,13 +233,10 @@ describe("RecipientDashboard", () => {
       fireEvent.click(screen.getByLabelText(/claim 500 USDC from stream 1/i));
     });
 
-    // Stream should still show original vested amount in the table cell (not optimistically updated)
     await waitFor(() => {
       const vestedCells = screen.getAllByText(/500.*USDC/);
-      // At least one cell (the <strong> in the table) should still show 500
       expect(vestedCells.length).toBeGreaterThan(0);
     });
-    // Claim button should still show the original amount (not 0)
     expect(screen.getByLabelText(/claim 500 USDC from stream 1/i)).toBeInTheDocument();
   });
 
